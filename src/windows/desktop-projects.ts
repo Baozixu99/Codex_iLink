@@ -37,23 +37,37 @@ export function readDesktopProjects(primaryPath: string): DesktopProject[] {
 export function parseDesktopProjects(value: unknown): DesktopProject[] {
   if (!isRecord(value)) throw invalidDesktopProjectState();
   const savedRoots = value["electron-saved-workspace-roots"];
-  if (!Array.isArray(savedRoots)) throw invalidDesktopProjectState();
+  const localProjects = value["local-projects"];
+  if (localProjects !== undefined && !isRecord(localProjects)) {
+    throw invalidDesktopProjectState();
+  }
+  if (!Array.isArray(savedRoots) && !isRecord(localProjects)) {
+    throw invalidDesktopProjectState();
+  }
 
   const roots = new Map<string, string>();
-  for (const rawRoot of savedRoots) {
+  for (const rawRoot of Array.isArray(savedRoots) ? savedRoots : []) {
     const cwd = normalizeProjectPath(rawRoot);
     if (!cwd) throw invalidDesktopProjectState();
     if (!roots.has(pathKey(cwd))) roots.set(pathKey(cwd), cwd);
+  }
+  if (!Array.isArray(savedRoots) && isRecord(localProjects)) {
+    for (const project of Object.values(localProjects)) {
+      if (!isRecord(project) || !Array.isArray(project.rootPaths)) {
+        throw invalidDesktopProjectState();
+      }
+      for (const rawRoot of project.rootPaths) {
+        const cwd = normalizeProjectPath(rawRoot);
+        if (!cwd) throw invalidDesktopProjectState();
+        if (!roots.has(pathKey(cwd))) roots.set(pathKey(cwd), cwd);
+      }
+    }
   }
 
   const ordered: string[] = [];
   const seen = new Set<string>();
   const projectOrder = value["project-order"];
   if (projectOrder !== undefined && !Array.isArray(projectOrder)) {
-    throw invalidDesktopProjectState();
-  }
-  const localProjects = value["local-projects"];
-  if (localProjects !== undefined && !isRecord(localProjects)) {
     throw invalidDesktopProjectState();
   }
   for (const orderEntry of projectOrder ?? []) {

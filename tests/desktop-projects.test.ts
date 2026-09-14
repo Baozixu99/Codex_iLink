@@ -33,6 +33,21 @@ test("Desktop saved workspace roots define the project set, order, and names", (
   );
 });
 
+test("Desktop migrated state may have no legacy roots and no saved projects", () => {
+  assert.deepEqual(parseDesktopProjects({ "local-projects": {} }), []);
+});
+
+test("Desktop migrated state reads local project roots without legacy roots", () => {
+  assert.deepEqual(
+    parseDesktopProjects({
+      "local-projects": {
+        current: { rootPaths: ["D:\\Current"] },
+      },
+    }),
+    [{ cwd: "D:\\Current", name: "Current" }],
+  );
+});
+
 test("Desktop project ids resolve through local-projects before ordering roots", () => {
   assert.deepEqual(
     parseDesktopProjects({

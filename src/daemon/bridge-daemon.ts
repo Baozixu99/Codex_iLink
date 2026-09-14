@@ -165,6 +165,18 @@ export class BridgeDaemon {
     }
 
     let mainThreadId = this.#options.state.getBridgeSettings().mainThreadId;
+    if (mainThreadId) {
+      try {
+        await this.#options.codex.resumeThread(mainThreadId);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (/no rollout found for thread id/iu.test(message)) {
+          mainThreadId = null;
+        } else {
+          throw error;
+        }
+      }
+    }
     if (!mainThreadId) {
       if (!this.#options.newThreadPermissions) {
         throw new Error("Desktop permission source is not configured");

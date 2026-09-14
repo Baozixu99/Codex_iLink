@@ -227,8 +227,59 @@ test("daemon creates one persistent main thread and polls iLink", async () => {
     });
     await restarted.start();
     assert.equal(starts, 1);
-    assert.deepEqual(resumed, ["thread-desktop"]);
+    assert.deepEqual(resumed, ["thread-desktop", "thread-main"]);
     await restarted.stop();
+  } finally {
+    leases.close();
+    state.close();
+    rmSync(directory, { force: true, recursive: true });
+  }
+});
+
+test("daemon replaces a main thread whose Codex rollout is missing", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "codex-ilink-missing-main-"));
+  const databasePath = join(directory, "state.sqlite");
+  const state = new SqliteState(databasePath);
+  const leases = new SqliteTurnLeaseStore(databasePath);
+  state.bindController({ accountId: "bot-a", boundAtMs: 1, userId: "controller-a" });
+  state.setMainThreadId("missing-main");
+  let replacements = 0;
+  const daemon = new BridgeDaemon({
+    bridgeInstanceId: "bridge-instance",
+    codex: {
+      close() {},
+      onEvent() { return () => undefined; },
+      async readThread() { return { thread: { turns: [] } }; },
+      async resumeThread(threadId: string) {
+        throw new Error(`no rollout found for thread id ${threadId} (code=-32600)`);
+      },
+      async setThreadName() { return {}; },
+      async startThread() {
+        replacements += 1;
+        return { thread: { id: "replacement-main" } };
+      },
+      async startTurn() { assert.fail("no inbound turn"); },
+    },
+    hookReceiver: {
+      async close() {}, async drainSpool() { return 0; }, async start() {},
+    },
+    ilink: {
+      async getUpdates() { return { cursor: "cursor", kind: "timeout" as const }; },
+      async sendText() { assert.fail("no outbound message"); },
+    },
+    inboxDirectory: join(directory, "Inbox"),
+    leases,
+    newThreadPermissions: () => ({}),
+    newId: randomUUID,
+    now: () => 1_000,
+    session,
+    state,
+  });
+  try {
+    await daemon.start();
+    assert.equal(replacements, 1);
+    assert.equal(state.getBridgeSettings().mainThreadId, "replacement-main");
+    await daemon.stop();
   } finally {
     leases.close();
     state.close();
@@ -3252,7 +3303,7 @@ test("daemon startup recovers unprocessed inbound and safe queued turns without 
       { text: "recover inbound", threadId: "thread-main" },
       { text: "recover queued", threadId: "thread-queued" },
     ]);
-    assert.deepEqual(resumed, ["thread-main", "thread-queued"]);
+    assert.deepEqual(resumed, ["thread-main", "thread-main", "thread-queued"]);
     assert.equal(state.listInboundMessages()[0]?.body, null);
     assert.equal(state.countQueuedTurns(), 0);
     assert.equal(state.getDispatchIntent("operation-unknown")?.status, "unknown");
