@@ -358,7 +358,7 @@ export class BridgeEngine {
     beforeAcceptedMessage?: () => Promise<void>;
     cursor: string;
     messages: readonly WireWeixinMessage[];
-    onAccepted?: () => Promise<void>;
+    onAccepted?: () => void;
   }): Promise<{ accepted: number; sent: number }> {
     const parsed = input.messages.map((message) =>
       parseControllerMessage(message, this.#session.controllerUserId),
@@ -404,7 +404,7 @@ export class BridgeEngine {
       updatedAtMs: this.#now(),
     });
     const acceptedIds = new Set(accepted.acceptedMessageIds);
-    if (acceptedIds.size > 0) await input.onAccepted?.();
+    if (acceptedIds.size > 0) input.onAccepted?.();
     let sent = 0;
     const processedAcceptedIds = new Set<string>();
 

@@ -142,13 +142,14 @@ export type OutboxItem = {
   confirmedAtMs: number | null;
   contextToken: string;
   createdAtMs: number;
+  expiresAtMs?: number;
   status: "confirmed" | "pending";
   targetUserId: string;
 };
 
 export type PendingOutboxInput = Pick<
   OutboxItem,
-  "body" | "clientId" | "contextToken" | "createdAtMs" | "targetUserId"
+  "body" | "clientId" | "contextToken" | "createdAtMs" | "expiresAtMs" | "targetUserId"
 >;
 
 export type BridgeRuntime = {
@@ -244,6 +245,9 @@ export class SqliteState {
           `DELETE FROM outbox
            WHERE status = 'confirmed' AND confirmed_at_ms <= ?`,
         )
+        .run(cutoffMs);
+      this.#database
+        .prepare("DELETE FROM outbox WHERE discarded_at_ms <= ?")
         .run(cutoffMs);
       const completedDispatchIntents = this.#database
         .prepare(
@@ -1759,8 +1763,8 @@ export class SqliteState {
       .prepare(
         `INSERT INTO outbox
           (client_id, target_user_id, context_token, body, body_sha256,
-           status, created_at_ms, confirmed_at_ms)
-         VALUES (?, ?, ?, ?, ?, 'pending', ?, NULL)`,
+           status, created_at_ms, confirmed_at_ms, expires_at_ms)
+         VALUES (?, ?, ?, ?, ?, 'pending', ?, NULL, ?)`,
       )
       .run(
         input.clientId,
@@ -1769,6 +1773,7 @@ export class SqliteState {
         input.body,
         bodyHash,
         input.createdAtMs,
+        input.expiresAtMs ?? null,
       );
     return this.#requireOutbox(input.clientId);
   }
@@ -1777,6 +1782,21 @@ export class SqliteState {
     return this.#transaction(() =>
       inputs.map((input) => this.enqueueOutbox(input)),
     );
+  }
+
+  discardPendingNotifications(
+    clientIds: readonly string[],
+    nowMs: number,
+    summary?: PendingOutboxInput,
+  ): OutboxItem | undefined {
+    return this.#transaction(() => {
+      const discard = this.#database.prepare(
+        `UPDATE outbox SET body = NULL, context_token = '', discarded_at_ms = ?
+         WHERE client_id = ? AND status = 'pending' AND discarded_at_ms IS NULL`,
+      );
+      for (const clientId of clientIds) discard.run(nowMs, clientId);
+      return summary ? this.enqueueOutbox(summary) : undefined;
+    });
   }
 
   replacePendingOutboxBody(clientId: string, body: string): OutboxItem {
@@ -1788,7 +1808,7 @@ export class SqliteState {
     this.#database
       .prepare(
         `UPDATE outbox SET body = ?, body_sha256 = ?
-         WHERE client_id = ? AND status = 'pending'`,
+         WHERE client_id = ? AND status = 'pending' AND discarded_at_ms IS NULL`,
       )
       .run(body, sha256(body), clientId);
     return this.#requireOutbox(clientId);
@@ -1803,8 +1823,8 @@ export class SqliteState {
     const rows = this.#database
       .prepare(
         `SELECT client_id, target_user_id, context_token, body, body_sha256,
-                status, created_at_ms, confirmed_at_ms
-         FROM outbox WHERE status = 'pending'
+                status, created_at_ms, confirmed_at_ms, expires_at_ms
+         FROM outbox WHERE status = 'pending' AND discarded_at_ms IS NULL
          ORDER BY created_at_ms, client_id`,
       )
       .all() as OutboxRow[];
@@ -1823,7 +1843,7 @@ export class SqliteState {
         .prepare(
           `UPDATE outbox
            SET status = 'confirmed', body = NULL, confirmed_at_ms = ?
-           WHERE client_id = ? AND status = 'pending'`,
+           WHERE client_id = ? AND status = 'pending' AND discarded_at_ms IS NULL`,
         )
         .run(confirmedAtMs, clientId);
       if (notificationRoute) this.putNotificationRoute(notificationRoute);
@@ -2323,6 +2343,7 @@ export class SqliteState {
       "./migrations/014-drop-thread-permission-profiles.sql",
       "./migrations/015-default-thread-permissions.sql",
       "./migrations/016-terminal-notification-jobs.sql",
+      "./migrations/017-outbox-notification-lifetime.sql",
     ];
     const observed = this.#database.prepare("PRAGMA user_version").get() as
       | { user_version: number }
@@ -2434,7 +2455,7 @@ export class SqliteState {
     return this.#database
       .prepare(
         `SELECT client_id, target_user_id, context_token, body, body_sha256,
-                status, created_at_ms, confirmed_at_ms
+                status, created_at_ms, confirmed_at_ms, expires_at_ms
          FROM outbox WHERE client_id = ?`,
       )
       .get(clientId) as OutboxRow | undefined;
@@ -2578,6 +2599,7 @@ type OutboxRow = {
   confirmed_at_ms: number | null;
   context_token: string;
   created_at_ms: number;
+  expires_at_ms: number | null;
   status: "confirmed" | "pending";
   target_user_id: string;
 };
@@ -2589,6 +2611,7 @@ function outboxItemFromRow(row: OutboxRow): OutboxItem {
     confirmedAtMs: row.confirmed_at_ms,
     contextToken: row.context_token,
     createdAtMs: row.created_at_ms,
+    ...(row.expires_at_ms === null ? {} : { expiresAtMs: row.expires_at_ms }),
     status: row.status,
     targetUserId: row.target_user_id,
   };

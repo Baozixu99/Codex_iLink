@@ -830,7 +830,7 @@ test("expired authentication in a startup Outbox keeps the Bridge running for co
       async close() {}, async drainSpool() { return 0; }, async start() {},
     },
     ilink: {
-      async getUpdates() { assert.fail("Outbox should fail before polling"); },
+      async getUpdates() { return { cursor: "", kind: "timeout" as const }; },
       async sendText() {
         sends += 1;
         throw new ILinkError({
@@ -849,13 +849,13 @@ test("expired authentication in a startup Outbox keeps the Bridge running for co
 
   try {
     await daemon.start();
-    assert.equal(sends, 2, "both bounded startup drains may observe the pause");
+    assert.equal(sends, 1, "startup makes one bounded delivery attempt");
     await assert.rejects(
       daemon.pollOnce(),
       (error: unknown) =>
         error instanceof ILinkError && error.kind === "auth-expired",
     );
-    assert.equal(sends, 3);
+    assert.equal(sends, 2);
     assert.equal(state.getOutbox("startup-auth-expired")?.status, "pending");
     await daemon.stop();
   } finally {
@@ -3332,6 +3332,15 @@ test("the next real controller message retries a delivery deferred for this daem
           };
         }
         transportAvailable = true;
+        for (const turnId of ["desktop-one", "desktop-two"]) {
+          state.enqueueOutbox({
+            body: "buffered Desktop reply",
+            clientId: `codex-ilink:desktop:thread-desktop:${turnId}:final`,
+            contextToken: "ctx-original",
+            createdAtMs: 1,
+            targetUserId: session.controllerUserId,
+          });
+        }
         return {
           cursor: "cursor-inbound",
           kind: "updates" as const,
@@ -3370,9 +3379,10 @@ test("the next real controller message retries a delivery deferred for this daem
 
     await daemon.pollOnce();
     assert.equal(state.getOutbox("original-deferred-client")?.status, "confirmed");
-    assert.equal(sendTexts.length, 5);
-    assert.equal(sendTexts.at(-2), "original undelivered reply");
-    assert.ok(sendTexts.at(-1)?.includes("s<n>"));
+    assert.equal(sendTexts.length, 6);
+    assert.ok(sendTexts[3]?.includes("s<n>"));
+    assert.equal(sendTexts[4], "original undelivered reply");
+    assert.match(sendTexts[5] ?? "", /有 2 个 Codex 任务的通知积压/u);
     await daemon.stop();
   } finally {
     leases.close();

@@ -26,6 +26,75 @@ const session: ILinkSession = {
   controllerUserId: "controller-a",
 };
 
+test("old terminal notifications expire and fresh turns become one durable summary", async () => {
+  await withState(async (state) => {
+    const nowMs = 3 * 24 * 60 * 60_000;
+    const notify = (clientId: string, createdAtMs: number, expiresAtMs?: number) =>
+      state.enqueueOutbox({
+        body: "old or buffered desktop answer",
+        clientId: `codex-ilink:${clientId}`,
+        contextToken: "context",
+        createdAtMs,
+        ...(expiresAtMs === undefined ? {} : { expiresAtMs }),
+        targetUserId: session.controllerUserId,
+      });
+    const oldDesktop = notify("desktop:thread:old:final", nowMs - 30 * 60_000);
+    const oldAutomation = notify("automation:thread:old:final", nowMs - 24 * 60 * 60_000);
+    const newlyEnqueuedButExpired = notify("desktop:thread:late:final", nowMs, nowMs);
+    const first = notify("desktop:thread:new:final:part:1", nowMs - 2);
+    const second = notify("desktop:thread:new:final:part:2", nowMs - 2);
+    const third = notify("automation:thread:weekly:final", nowMs - 1);
+    state.enqueueOutbox({
+      body: "微信任务结果",
+      clientId: "codex-ilink:wechat-turn:final",
+      contextToken: "context",
+      createdAtMs: 1,
+      targetUserId: session.controllerUserId,
+    });
+    state.bindController({ accountId: session.botId, boundAtMs: 1, userId: session.controllerUserId });
+    state.acceptInboundBatch({
+      accountId: session.botId,
+      controllerUserId: session.controllerUserId,
+      messages: [{
+        body: "help",
+        contextToken: "latest",
+        messageId: "1",
+        receivedAtMs: nowMs,
+      }],
+      nextCursor: "cursor",
+      updatedAtMs: nowMs,
+    });
+    const sent: Array<{ clientId: string; text: string }> = [];
+    const makeWorker = (failSummary: boolean) => new OutboxWorker({
+      ilink: {
+        async sendText(input) {
+          sent.push(input);
+          if (failSummary && input.clientId.includes(":notification-summary:")) {
+            throw new Error("offline");
+          }
+          return { accepted: true, clientId: input.clientId };
+        },
+      },
+      maxAttempts: 1,
+      now: () => nowMs,
+      session,
+      state,
+    });
+
+    await makeWorker(true).drain();
+    assert.equal(sent[0]?.text, "微信任务结果");
+    assert.match(sent[1]?.text ?? "", /有 2 个 Codex 任务的通知积压/u);
+    assert.equal(state.listPendingOutbox().length, 1);
+    for (const item of [oldDesktop, oldAutomation, newlyEnqueuedButExpired, first, second, third]) {
+      assert.equal(state.getOutbox(item.clientId)?.body, null);
+    }
+    await makeWorker(false).drain();
+    assert.equal(sent.length, 3);
+    assert.equal(sent[2]?.clientId, sent[1]?.clientId);
+    assert.deepEqual(state.listPendingOutbox(), []);
+  });
+});
+
 test("an outbox item without context is deferred without a failed attempt", async () => {
   await withState(async (state) => {
     state.enqueueOutbox({

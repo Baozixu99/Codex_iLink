@@ -49,6 +49,31 @@ test("terminal notification sources fail closed on unknown values", () => {
   assert.equal(terminalNotificationOrigin(undefined), null);
 });
 
+test("replayed Stop events keep their original notification deadline", async () => {
+  await withState(async (state) => {
+    const desktopExpiry = stopEvent.capturedAtMs + 30 * 60_000;
+    const automationExpiry = stopEvent.capturedAtMs + 24 * 60 * 60_000;
+    let nowMs = desktopExpiry;
+    const notifier = new DesktopNotifier({
+      now: () => nowMs,
+      presence: async () => "away",
+      readThread: async () => ({ thread: { name: "后台任务" } }),
+      session,
+      state,
+    });
+    assert.equal(await notifier.notifyTerminal(stopEvent, "completed"), "expired");
+    assert.deepEqual(state.listPendingOutbox(), []);
+    assert.equal(await notifier.notifyTerminal(stopEvent, "completed", {
+      origin: "automation",
+    }), "queued");
+    assert.equal(state.listPendingOutbox()[0]?.expiresAtMs, automationExpiry);
+    nowMs = automationExpiry;
+    assert.equal(await notifier.notifyTerminal(stopEvent, "completed", {
+      origin: "automation",
+    }), "expired");
+  });
+});
+
 test("an away Desktop completion is retained before any iLink context exists", async () => {
   await withState(async (state) => {
     state.bindController({ accountId: "bot-a", boundAtMs: 1, userId: "controller-a" });

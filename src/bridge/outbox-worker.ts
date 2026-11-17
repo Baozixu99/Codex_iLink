@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   SqliteState,
   type NotificationRoute,
@@ -5,7 +6,10 @@ import {
 } from "./sqlite-state.ts";
 import type { ILinkSender } from "./bridge.ts";
 import { ILinkError, type ILinkSession } from "../ilink/protocol.ts";
-import { parseDesktopNotificationClientId } from "./desktop-notification-identity.ts";
+import {
+  parseDesktopNotificationClientId,
+  terminalNotificationExpiry,
+} from "./desktop-notification-identity.ts";
 import { dispatchOutboxItem } from "./outbox-delivery.ts";
 import { WECHAT_FINAL_MAX_MESSAGES } from "./wechat-output.ts";
 
@@ -16,6 +20,7 @@ export type OutboxDrainResult = {
 };
 
 export type OutboxWorkerOptions = {
+  canSendNotifications?: () => boolean;
   ilink: ILinkSender;
   maxAttempts?: number;
   now: () => number;
@@ -36,8 +41,11 @@ export type OutboxWorkerOptions = {
   state: SqliteState;
 };
 
+const NOTIFICATION_SUMMARY_PREFIX = "codex-ilink:notification-summary:";
+
 /** Replays durable pending sends with one stable iLink client_id. */
 export class OutboxWorker {
+  readonly #canSendNotifications: () => boolean;
   readonly #failedForRun = new Set<string>();
   readonly #ilink: ILinkSender;
   readonly #maxAttempts: number;
@@ -51,6 +59,7 @@ export class OutboxWorker {
   #draining: Promise<OutboxDrainResult> | undefined;
 
   constructor(options: OutboxWorkerOptions) {
+    this.#canSendNotifications = options.canSendNotifications ?? (() => true);
     this.#ilink = options.ilink;
     this.#maxAttempts = options.maxAttempts ?? 3;
     this.#now = options.now;
@@ -82,14 +91,17 @@ export class OutboxWorker {
   }
 
   async #drain(signal?: AbortSignal): Promise<OutboxDrainResult> {
+    if (signal?.aborted) throw signal.reason;
     const result: OutboxDrainResult = { confirmed: 0, deferred: 0, failed: 0 };
     const blockedFinalReplies = new Set<string>();
-    for (const item of this.#state.listPendingOutbox()) {
+    for (const item of this.#preparePendingItems()) {
       if (signal?.aborted) throw signal.reason;
       const finalReply = finalReplyGroup(item.clientId);
-      const contextToken =
-        item.contextToken ||
-        this.#state.getILinkState(this.#session.botId)?.contextToken;
+      const expiresAtMs = notificationExpiry(item);
+      const latestContext = this.#state.getILinkState(this.#session.botId)?.contextToken;
+      const contextToken = item.clientId.startsWith(NOTIFICATION_SUMMARY_PREFIX)
+        ? latestContext || item.contextToken
+        : item.contextToken || latestContext;
       if (
         item.body === null ||
         !contextToken ||
@@ -102,9 +114,26 @@ export class OutboxWorker {
       }
 
       let confirmed = false;
+      let deferred = false;
       for (let attempt = 1; attempt <= this.#maxAttempts; attempt += 1) {
+        if (expiresAtMs !== undefined) {
+          const nowMs = this.#now();
+          if (expiresAtMs <= nowMs) {
+            this.#discardNotifications([item.clientId], nowMs);
+            deferred = true;
+            break;
+          }
+          if (!this.#canSendNotifications()) {
+            result.deferred += 1;
+            deferred = true;
+            break;
+          }
+        }
         try {
-          const current = this.#state.getOutbox(item.clientId) ?? item;
+          const current = this.#state.getOutbox(item.clientId);
+          if (!current || current.status !== "pending" || current.body === null) {
+            break;
+          }
           const dispatched = await dispatchOutboxItem({
             contextToken,
             ilink: this.#ilink,
@@ -139,7 +168,7 @@ export class OutboxWorker {
           }
         }
       }
-      if (!confirmed) {
+      if (!confirmed && !deferred) {
         this.#failedForRun.add(item.clientId);
         if (finalReply !== null) blockedFinalReplies.add(finalReply);
         result.failed += 1;
@@ -147,6 +176,67 @@ export class OutboxWorker {
     }
     return result;
   }
+
+  #preparePendingItems(): OutboxItem[] {
+    const nowMs = this.#now();
+    const replies: OutboxItem[] = [];
+    const summaries: OutboxItem[] = [];
+    const notifications: OutboxItem[] = [];
+    const notificationIds = new Set<string>();
+    const expired: string[] = [];
+    let summaryExpiry = Infinity;
+    for (const item of this.#state.listPendingOutbox()) {
+      const expiresAtMs = notificationExpiry(item);
+      if (expiresAtMs === undefined) {
+        replies.push(item);
+        continue;
+      }
+      if (expiresAtMs <= nowMs) {
+        expired.push(item.clientId);
+        continue;
+      }
+      if (item.clientId.startsWith(NOTIFICATION_SUMMARY_PREFIX)) {
+        summaries.push(item);
+        continue;
+      }
+      const identity = parseDesktopNotificationClientId(item.clientId);
+      if (!identity) continue;
+      notifications.push(item);
+      notificationIds.add(identity.baseClientId);
+      summaryExpiry = Math.min(summaryExpiry, expiresAtMs);
+    }
+    if (expired.length > 0) this.#discardNotifications(expired, nowMs);
+    if (!this.#canSendNotifications()) return replies;
+    // A persisted summary keeps its identity and is retried before a new batch.
+    if (summaries.length > 0) return [...replies, ...summaries];
+    if (notificationIds.size < 2) return [...replies, ...notifications];
+
+    const clientIds = notifications.map(({ clientId }) => clientId);
+    const hash = createHash("sha256").update(JSON.stringify(clientIds)).digest("hex");
+    const summary = this.#state.discardPendingNotifications(clientIds, nowMs, {
+      body: `有 ${notificationIds.size} 个 Codex 任务的通知积压。请在 Codex Desktop 查看详情，或发 p 选择项目后进入对应会话。`,
+      clientId: NOTIFICATION_SUMMARY_PREFIX + hash,
+      contextToken: notifications.at(-1)?.contextToken ?? "",
+      createdAtMs: nowMs,
+      expiresAtMs: summaryExpiry,
+      targetUserId: this.#session.controllerUserId,
+    });
+    for (const clientId of clientIds) this.#failedForRun.delete(clientId);
+    return summary ? [...replies, summary] : replies;
+  }
+
+  #discardNotifications(clientIds: readonly string[], nowMs: number): void {
+    this.#state.discardPendingNotifications(clientIds, nowMs);
+    for (const clientId of clientIds) this.#failedForRun.delete(clientId);
+  }
+}
+
+function notificationExpiry(item: OutboxItem): number | undefined {
+  if (item.expiresAtMs !== undefined) return item.expiresAtMs;
+  const identity = parseDesktopNotificationClientId(item.clientId);
+  return identity
+    ? terminalNotificationExpiry(identity.origin, item.createdAtMs)
+    : undefined;
 }
 
 function finalReplyGroup(clientId: string): string | null {

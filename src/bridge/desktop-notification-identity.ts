@@ -11,6 +11,14 @@ export type DesktopNotificationIdentity = {
 
 export type TerminalNotificationOrigin = "automation" | "desktop";
 
+export function terminalNotificationExpiry(
+  origin: TerminalNotificationOrigin,
+  completedAtMs: number,
+): number {
+  const minutes = origin === "desktop" ? 30 : 24 * 60;
+  return completedAtMs + minutes * 60_000;
+}
+
 const DESKTOP_NOTIFICATION_CLIENT_ID =
   /^(codex-ilink:(automation|desktop):([A-Za-z0-9-]+):([A-Za-z0-9-]+):(final|notice))(?::part:([1-9][0-9]*))?$/u;
 

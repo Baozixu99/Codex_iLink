@@ -95,7 +95,7 @@ try {
     const reopened = new SqliteState(path);
     assert.deepEqual(reopened.storageDiagnostics(), {
       journalMode: "wal",
-      schemaVersion: 16,
+      schemaVersion: 17,
       synchronous: "full",
     });
     assert.deepEqual(reopened.listQueuedTurns(), [
@@ -222,7 +222,7 @@ test("schema v11 attachment intents migrate as untrusted legacy paths", () => {
     database.close();
 
     migrated = new SqliteState(path);
-    assert.equal(migrated.storageDiagnostics().schemaVersion, 16);
+    assert.equal(migrated.storageDiagnostics().schemaVersion, 17);
     assert.equal(
       migrated.listOutboundAttachmentIntents("legacy-turn")[0]
         ?.snapshotProvenance,
@@ -298,7 +298,7 @@ test("schema v13 adds bounded transport indexes without losing state", () => {
     database.close();
 
     state = new SqliteState(path);
-    assert.equal(state.storageDiagnostics().schemaVersion, 16);
+    assert.equal(state.storageDiagnostics().schemaVersion, 17);
     assert.equal(state.listInboundMessages()[0]?.messageId, "message-index");
     state.close();
     state = null;
@@ -707,7 +707,7 @@ test("controller identity and database configuration survive reopening", () => {
     const first = new SqliteState(path);
     assert.deepEqual(first.storageDiagnostics(), {
       journalMode: "wal",
-      schemaVersion: 16,
+      schemaVersion: 17,
       synchronous: "full",
     });
     assert.deepEqual(
@@ -772,7 +772,7 @@ test("schema v14 removes legacy local permission profiles", () => {
     database.close();
 
     migrated = new SqliteState(path);
-    assert.equal(migrated.storageDiagnostics().schemaVersion, 16);
+    assert.equal(migrated.storageDiagnostics().schemaVersion, 17);
     migrated.close();
     migrated = null;
 
@@ -2387,7 +2387,7 @@ test("schema v6 deletes legacy plain-text scheduler payloads", () => {
     database.close();
 
     state = new SqliteState(path);
-    assert.equal(state.storageDiagnostics().schemaVersion, 16);
+    assert.equal(state.storageDiagnostics().schemaVersion, 17);
     assert.deepEqual(state.listQueuedTurns(), []);
     assert.equal(state.getDispatchIntent("legacy-operation"), null);
     assert.equal(state.countActiveDispatches(), 0);
@@ -2549,7 +2549,7 @@ test("schema v15 keeps legacy permission defaults inert", () => {
     database.close();
 
     reopened = new SqliteState(path);
-    assert.equal(reopened.storageDiagnostics().schemaVersion, 16);
+    assert.equal(reopened.storageDiagnostics().schemaVersion, 17);
     reopened.resetUserTimingSettings(1_000);
     reopened.close();
     reopened = null;

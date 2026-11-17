@@ -8,6 +8,7 @@ import {
   desktopNotificationCandidateClientIds,
   desktopNotificationMessageClientIds,
   terminalNotificationClientId,
+  terminalNotificationExpiry,
   type TerminalNotificationOrigin,
 } from "../bridge/desktop-notification-identity.ts";
 import {
@@ -34,6 +35,7 @@ export type DesktopNotifierOptions = {
 export type DesktopNotificationResult =
   | "already-sent"
   | "cancelled"
+  | "expired"
   | "present"
   | "queued";
 
@@ -121,6 +123,8 @@ export class DesktopNotifier {
     context: DesktopNotificationContext,
   ): Promise<DesktopNotificationResult> {
     if (context.signal?.aborted) return "cancelled";
+    const expiresAtMs = terminalNotificationExpiry(origin, event.capturedAtMs);
+    if (expiresAtMs <= this.#now()) return "expired";
     if (hasDesktopNotification(this.#state, clientId)) return "already-sent";
     if (origin === "desktop") {
       let presence = context.presence;
@@ -163,6 +167,7 @@ export class DesktopNotifier {
         : []),
     ].join("\n\n");
     const nowMs = this.#now();
+    if (expiresAtMs <= nowMs) return "expired";
     const messages = formatWechatFinalReply(safeText);
     const contextToken =
       this.#state.getILinkState(this.#session.botId)?.contextToken ?? "";
@@ -177,6 +182,7 @@ export class DesktopNotifier {
         clientId: clientIds[index] ?? clientId,
         contextToken,
         createdAtMs: nowMs,
+        expiresAtMs,
         targetUserId: this.#session.controllerUserId,
       })),
     );

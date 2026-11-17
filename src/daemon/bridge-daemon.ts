@@ -24,6 +24,7 @@ import { heartbeatTerminalDecision } from "./heartbeat-notification.ts";
 import {
   isFinalDesktopNotificationPart,
   parseDesktopNotificationClientId,
+  terminalNotificationExpiry,
   type TerminalNotificationOrigin,
 } from "../bridge/desktop-notification-identity.ts";
 import type { HookDecision, HookEvent } from "../hooks/hook-receiver.ts";
@@ -123,6 +124,7 @@ export class BridgeDaemon {
   readonly #codexEventTasks = new Set<Promise<unknown>>();
   #terminalNotifier: DesktopNotifier | undefined;
   #outbox: OutboxWorker | undefined;
+  #processingInbound = false;
   #nextTransportMaintenanceAtMs = 0;
   #started = false;
   #terminalNotificationJobOffset = 0;
@@ -219,6 +221,7 @@ export class BridgeDaemon {
       state: this.#options.state,
     });
     this.#outbox = new OutboxWorker({
+      canSendNotifications: () => !this.#processingInbound,
       ilink: this.#options.ilink,
       now: this.#options.now,
       outboundDirectory,
@@ -258,16 +261,17 @@ export class BridgeDaemon {
     this.#started = true;
     await this.#notifyILinkLifecycle("notifyStart");
     await this.#options.hookReceiver.start();
-    await this.#options.hookReceiver.drainSpool();
-    await this.#reconcileTerminalNotificationJobs();
-    await this.#allowStartupAuthPause(() => this.#outbox?.drain());
-    await this.#reconcilePendingDesktopNotifications();
-    await this.#allowStartupAuthPause(() => this.#outbox?.drain());
+    this.#processingInbound = true;
     try {
+      await this.#options.hookReceiver.drainSpool();
+      await this.#reconcileTerminalNotificationJobs();
+      await this.#reconcilePendingDesktopNotifications();
       await this.#allowStartupAuthPause(() => this.#bridge?.recoverPendingWork());
     } finally {
+      this.#processingInbound = false;
       await this.#syncActiveTaskCount();
     }
+    await this.#allowStartupAuthPause(() => this.#outbox?.drain());
   }
 
   async #allowStartupAuthPause(
@@ -291,38 +295,39 @@ export class BridgeDaemon {
     this.#options.state.pruneExpiredDesktopObservationTombstones(
       pollNowMs,
     );
-    await this.#options.hookReceiver.drainSpool();
-    await this.#reconcileTerminalNotificationJobs(signal);
-    await this.#bridge.reconcilePendingWork();
-    await this.#reconcilePendingDesktopNotifications();
-    await this.#syncActiveTaskCount();
-    await this.#outbox?.drain(signal);
-    const cursor =
-      this.#options.state.getILinkState(this.#options.session.botId)?.cursor ?? "";
-    const updates = await this.#options.ilink.getUpdates({
-      cursor,
-      session: this.#options.session,
-      ...(signal ? { signal } : {}),
-    });
-    // A Desktop prompt can arrive while the iLink long-poll is waiting. Drain
-    // it before processing the returned batch so s<n> cannot race that prompt.
-    await this.#options.hookReceiver.drainSpool();
-    if (updates.kind === "timeout") return { accepted: 0, sent: 0 };
+    let result = { accepted: 0, sent: 0 };
+    this.#processingInbound = true;
     try {
-      return await this.#bridge.ingestBatch({
-        beforeAcceptedMessage: async () => {
-          await this.#options.hookReceiver.drainSpool();
-        },
-        cursor: updates.cursor,
-        messages: updates.messages,
-        onAccepted: async () => {
-          this.#outbox?.resetDeferred();
-          await this.#outbox?.drain(signal);
-        },
+      await this.#options.hookReceiver.drainSpool();
+      await this.#reconcileTerminalNotificationJobs(signal);
+      await this.#bridge.reconcilePendingWork();
+      await this.#reconcilePendingDesktopNotifications();
+      await this.#syncActiveTaskCount();
+      const cursor =
+        this.#options.state.getILinkState(this.#options.session.botId)?.cursor ?? "";
+      const updates = await this.#options.ilink.getUpdates({
+        cursor,
+        session: this.#options.session,
+        ...(signal ? { signal } : {}),
       });
+      // Catch Desktop activity that arrived while iLink was long-polling.
+      await this.#options.hookReceiver.drainSpool();
+      if (updates.kind !== "timeout") {
+        result = await this.#bridge.ingestBatch({
+          beforeAcceptedMessage: async () => {
+            await this.#options.hookReceiver.drainSpool();
+          },
+          cursor: updates.cursor,
+          messages: updates.messages,
+          onAccepted: () => this.#outbox?.resetDeferred(),
+        });
+      }
     } finally {
+      this.#processingInbound = false;
       await this.#syncActiveTaskCount();
     }
+    await this.#outbox?.drain(signal);
+    return result;
   }
 
   async ingestHookEvent(
@@ -703,7 +708,10 @@ export class BridgeDaemon {
     signal?: AbortSignal,
     messageOverride?: string,
   ): Promise<void> {
-    if (signal?.aborted) return;
+    if (
+      signal?.aborted ||
+      terminalNotificationExpiry(origin, event.capturedAtMs) <= this.#options.now()
+    ) return;
     const notifier = this.#terminalNotifier;
     if (!notifier) return;
     const observePresence =
@@ -735,7 +743,7 @@ export class BridgeDaemon {
       thread,
     });
     if (signal?.aborted) return;
-    if (result !== "present" && result !== "cancelled") {
+    if (result === "queued" && !this.#processingInbound) {
       void this.#outbox?.drain().catch(() => undefined);
     }
   }
@@ -827,6 +835,18 @@ export class BridgeDaemon {
     const observePresence = this.#options.presenceObservation;
     const pending = this.#options.state.listPendingDesktopNotifications();
     if (!notifier || !observePresence || pending.length === 0) return;
+    const nowMs = this.#options.now();
+    const fresh = pending.filter((candidate) => {
+      if (terminalNotificationExpiry("desktop", candidate.completedAtMs) > nowMs) {
+        return true;
+      }
+      this.#options.state.deletePendingDesktopNotification(
+        candidate.threadId,
+        candidate.turnId,
+      );
+      return false;
+    });
+    if (fresh.length === 0) return;
 
     let observation: PresenceObservation;
     try {
@@ -835,7 +855,7 @@ export class BridgeDaemon {
       return;
     }
     const lastInputAtMs = this.#options.now() - observation.idleMilliseconds;
-    for (const candidate of pending) {
+    for (const candidate of fresh) {
       if (lastInputAtMs > candidate.completedAtMs) {
         this.#options.state.deletePendingDesktopNotification(
           candidate.threadId,
